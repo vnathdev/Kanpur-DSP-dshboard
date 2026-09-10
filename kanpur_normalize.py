@@ -353,7 +353,7 @@ def read_upload(data: bytes, filename: str) -> pd.DataFrame:
     return df.dropna(how="all")
 
 
-# Snapshot of the master tables, matching the sheet as published 2026-09-09.
+# Snapshot of the master tables, matching the sheet as published 2026-09-10.
 # Used only if neither the sheet nor a local definitions file is available.
 # Superseded by the published
 # sheet is unreachable. Keep in sync with the sheet; the app flags when it
@@ -363,13 +363,13 @@ FALLBACK_CATEGORY_ROWS = [
     ("Sanitation", "Dustbins not cleaned"),
     ("Sanitation", "Garbage dump"),
     ("Sanitation", "Garbage Lifting"),
+    ("Sanitation", "Debris Removal/Construction Material"),
     ("Sanitation", "Garbage not cleaned"),
     ("Sanitation", "Sweeping not done"),
     ("Engineering", "Pot hole fill up/Repairs to the damage surface"),
     ("Engineering", "Repairing"),
     ("Engineering", "Disposal of removed silt on the Road"),
     ("Malba", "Removal of debris"),
-    ("Malba", "Debris Removal/Construction Material"),
 ]
 FALLBACK_STATUSES = ["Pending", "Rejected", "Completed"]
 
