@@ -201,8 +201,14 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner="Parsing export…")
-def cached_parse(data: bytes, filename: str, _defs_key: tuple):
-    """Cached on the uploaded bytes, so a re-run of the same file is free."""
+def cached_parse(data: bytes, filename: str, defs_key: tuple):
+    """Cached on the uploaded bytes AND the active category mapping.
+
+    defs_key must NOT be renamed with a leading underscore: Streamlit skips
+    hashing any argument whose name starts with '_', which would cache the
+    parsed frame on the file alone and keep serving the old category mapping
+    after the definitions sheet changed.
+    """
     defs, _, _, _ = cached_definitions()
     raw = read_upload(data, filename)
     df, report = normalize_dump(raw, defs)
@@ -444,7 +450,10 @@ upload = st.sidebar.file_uploader(
 
 with st.sidebar.expander("⚙️ Category definitions"):
     if st.button("↻ Reload definitions"):
-        cached_definitions.clear()
+        # Clear everything: the parsed frame is derived from the definitions,
+        # so refreshing one without the other shows a new mapping over old
+        # numbers.
+        st.cache_data.clear()
         st.rerun()
     defs_upload = st.file_uploader(
         "Definitions override", type=["csv", "xlsx"],
