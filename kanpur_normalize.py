@@ -317,24 +317,59 @@ class LoadReport:
         return "\n".join(lines)
 
 
-def read_raw(path_or_url: str) -> pd.DataFrame:
-    """Read a portal export, stripping the banner row and the phantom column.
+def _clean_header(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value).replace("\xa0", " ")).strip()
 
-    Row 1 of the export is 'Complaints List ::Online Services'; the real header
-    is row 2, whose first cell is a non-breaking space above an empty column.
+
+def _header_row_index(raw: pd.DataFrame, max_scan: int = 12) -> int:
+    """Find which row holds the column headers.
+
+    The portal sometimes emits a banner row ('Complaints List ::Online
+    Services') above the header and sometimes does not, so the header is on
+    row 1 or row 2 depending on the export. Rather than assume either, score
+    the first few rows by how many expected column names they contain and
+    take the best. Falls back to row 0 if nothing scores, which is the
+    no-banner case.
+    """
+    wanted = {_norm_key(c) for c in EXPECTED_COLUMNS}
+    best_row, best_score = 0, 0
+    for i in range(min(max_scan, len(raw))):
+        cells = [_norm_key(_clean_header(v)) for v in raw.iloc[i].tolist()]
+        score = sum(1 for c in cells if c and c in wanted)
+        if score > best_score:
+            best_row, best_score = i, score
+    # Two matches is enough to beat a banner row, which matches none.
+    return best_row if best_score >= 2 else 0
+
+
+def _frame_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
+    """Turn a header-less read into a tidy frame with real column names."""
+    idx = _header_row_index(raw)
+    header = [_clean_header(v) for v in raw.iloc[idx].tolist()]
+    df = raw.iloc[idx + 1:].copy()
+    df.columns = header
+    # Drop the phantom leading column (its header is a non-breaking space) and
+    # any unnamed or all-empty trailing columns.
+    keep = [
+        c for i, c in enumerate(df.columns)
+        if c and not str(c).lower().startswith("unnamed")
+    ]
+    df = df.loc[:, keep]
+    df = df.loc[:, ~pd.Index(df.columns).duplicated()]
+    return df.dropna(how="all").reset_index(drop=True)
+
+
+def read_raw(path_or_url: str) -> pd.DataFrame:
+    """Read a portal export from a path or URL.
+
+    Handles both shapes the portal produces: with a banner row above the
+    header, and without one.
     """
     if str(path_or_url).lower().endswith((".xlsx", ".xlsm", ".xls")):
-        df = pd.read_excel(path_or_url, header=1)
+        raw = pd.read_excel(path_or_url, header=None, dtype=object)
     else:
-        df = pd.read_csv(path_or_url, header=1)
-
-    df.columns = [
-        re.sub(r"\s+", " ", str(c).replace("\xa0", " ")).strip()
-        for c in df.columns
-    ]
-    # Drop the phantom leading column and any all-empty trailing columns.
-    df = df.loc[:, [c for c in df.columns if c and not c.startswith("Unnamed")]]
-    return df.dropna(how="all")
+        raw = pd.read_csv(path_or_url, header=None, dtype=object)
+    return _frame_from_raw(raw)
 
 
 def read_upload(data: bytes, filename: str) -> pd.DataFrame:
@@ -342,15 +377,10 @@ def read_upload(data: bytes, filename: str) -> pd.DataFrame:
     import io
     buf = io.BytesIO(data)
     if filename.lower().endswith((".xlsx", ".xlsm", ".xls")):
-        df = pd.read_excel(buf, header=1)
+        raw = pd.read_excel(buf, header=None, dtype=object)
     else:
-        df = pd.read_csv(buf, header=1)
-    df.columns = [
-        re.sub(r"\s+", " ", str(c).replace("\xa0", " ")).strip()
-        for c in df.columns
-    ]
-    df = df.loc[:, [c for c in df.columns if c and not c.startswith("Unnamed")]]
-    return df.dropna(how="all")
+        raw = pd.read_csv(buf, header=None, dtype=object)
+    return _frame_from_raw(raw)
 
 
 # Snapshot of the master tables, matching the sheet as published 2026-09-10.
