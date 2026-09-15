@@ -282,6 +282,7 @@ class LoadReport:
     unparsed_closed: int = 0
     closed_before_opened: int = 0
     missing_columns: list[str] = field(default_factory=list)
+    found_columns: list[str] = field(default_factory=list)
 
     @property
     def is_clean(self) -> bool:
@@ -297,6 +298,7 @@ class LoadReport:
         lines = [f"{self.rows_in} rows in, {self.rows_out} rows out"]
         if self.missing_columns:
             lines.append(f"MISSING COLUMNS: {', '.join(self.missing_columns)}")
+            lines.append(f"columns found instead: {', '.join(self.found_columns) or '(none)'}")
         for label, mapping in (
             ("UNMAPPED sub-category", self.unmapped_subcategories),
             ("UNKNOWN status", self.unknown_statuses),
@@ -413,6 +415,19 @@ def fallback_definitions() -> Definitions:
     )
 
 
+def _col(df: pd.DataFrame, name: str) -> pd.Series:
+    """Column `name`, or an all-empty Series of the right length if absent.
+
+    df.get() returns None for a missing column, and None flowing into
+    pd.to_datetime yields a scalar NaT rather than a Series -- which then
+    fails on .isna(). Returning a real Series keeps a missing column as a
+    reportable condition instead of a crash.
+    """
+    if name in df.columns:
+        return df[name]
+    return pd.Series(pd.NA, index=df.index, dtype="object")
+
+
 def normalize_dump(
     df: pd.DataFrame,
     defs: Definitions,
@@ -422,12 +437,13 @@ def normalize_dump(
     alias_by_key = {_norm_key(k): v for k, v in aliases.items()}
 
     report = LoadReport(rows_in=len(df))
+    report.found_columns = [str(c) for c in df.columns]
     report.missing_columns = [c for c in EXPECTED_COLUMNS if c not in df.columns]
 
     out = pd.DataFrame(index=df.index)
-    out["comp_no"] = df.get("Comp. No.")
-    out["category_raw"] = df.get("Category")
-    out["sub_category_raw"] = df.get("Sub Category")
+    out["comp_no"] = _col(df, "Comp. No.")
+    out["category_raw"] = _col(df, "Category")
+    out["sub_category_raw"] = _col(df, "Sub Category")
 
     # --- derived analysis category ---------------------------------------
     keys = out["sub_category_raw"].map(_norm_key)
@@ -448,7 +464,7 @@ def normalize_dump(
     )
 
     # --- zone / ward ------------------------------------------------------
-    zw = df.get("Zone & Ward", pd.Series(index=df.index, dtype=object)).map(split_zone_ward)
+    zw = _col(df, "Zone & Ward").map(split_zone_ward)
     out["zone"] = [t[0] for t in zw]
     out["ward_name"] = [t[1] for t in zw]
     out["ward_no"] = pd.array([t[2] for t in zw], dtype="Int64")
@@ -458,13 +474,13 @@ def normalize_dump(
         ("Complainer Name & Mob. No.", "complainant_name", "complainant_mobile"),
         ("Concern Person Name & Mob. No.", "officer_name", "officer_mobile"),
     ):
-        parts = df.get(src, pd.Series(index=df.index, dtype=object)).map(split_name_mobile)
+        parts = _col(df, src).map(split_name_mobile)
         out[name_col] = [t[0] for t in parts]
         out[mob_col] = [t[1] for t in parts]
 
     # --- dates ------------------------------------------------------------
-    opened = pd.to_datetime(df.get("Date & Time"), format=DATE_FORMAT, errors="coerce")
-    closed = pd.to_datetime(df.get("Date of Closure"), format=DATE_FORMAT, errors="coerce")
+    opened = pd.to_datetime(_col(df, "Date & Time"), format=DATE_FORMAT, errors="coerce")
+    closed = pd.to_datetime(_col(df, "Date of Closure"), format=DATE_FORMAT, errors="coerce")
     out["opened_at"] = opened
     out["closed_at"] = closed
     report.unparsed_opened = int(opened.isna().sum())
@@ -475,7 +491,7 @@ def normalize_dump(
     report.closed_before_opened = int(((closed - opened).dt.total_seconds() < 0).sum())
 
     # --- status -----------------------------------------------------------
-    status = df.get("Status", pd.Series(index=df.index, dtype=object)).astype("string").str.strip()
+    status = _col(df, "Status").astype("string").str.strip()
     canonical = {_norm_key(s): s for s in defs.statuses}
     out["status"] = status.map(lambda s: canonical.get(_norm_key(s)))
     unknown = out["status"].isna() & status.notna()
@@ -483,6 +499,6 @@ def normalize_dump(
         report.unknown_statuses = status[unknown].value_counts().to_dict()
     out["status"] = out["status"].fillna(status)
 
-    out["description"] = df.get("Description")
+    out["description"] = _col(df, "Description")
     report.rows_out = len(out)
     return out.reset_index(drop=True), report

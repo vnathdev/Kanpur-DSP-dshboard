@@ -53,7 +53,8 @@ except NameError:  # exec'd or embedded rather than run as a script
 # ==========================================
 
 STATUS_COLUMNS = ["PENDING", "REJECTED", "CLOSED"]
-UNRESOLVED_STATUSES = ["PENDING"]
+UNRESOLVED_STATUSES = ["PENDING"]   # selects rows for the pendency views;
+                                    # no separate column, it duplicates PENDING
 STATUS_RANGE = ["#F59E0B", "#9CA3AF", "#10B981"]   # pending / rejected / closed
 
 CATEGORY_ORDER = ["Sanitation", "Engineering", "Malba", "Unmapped"]
@@ -277,7 +278,6 @@ def generate_pivot_summary(
             summary[col] = 0
     summary = summary[STATUS_COLUMNS]
 
-    summary["Unresolved Total"] = summary[UNRESOLVED_STATUSES].sum(axis=1)
     summary["Grand Total"] = summary[STATUS_COLUMNS].sum(axis=1)
     summary["% Closure"] = (
         summary["CLOSED"] / summary["Grand Total"] * 100
@@ -290,7 +290,7 @@ def generate_pivot_summary(
 
     totals = {
         c: summary[c].sum()
-        for c in STATUS_COLUMNS + ["Unresolved Total", "Grand Total"]
+        for c in STATUS_COLUMNS + ["Grand Total"]
     }
     totals["% Closure"] = round(
         totals["CLOSED"] / totals["Grand Total"] * 100 if totals["Grand Total"] else 0, 1
@@ -301,7 +301,7 @@ def generate_pivot_summary(
             None if pd.isna(mean_days) else round(mean_days, 1)
         )
 
-    order = STATUS_COLUMNS + ["Unresolved Total", "Grand Total", "% Closure"]
+    order = STATUS_COLUMNS + ["Grand Total", "% Closure"]
     if show_avg_time:
         order.append("Avg Closure Time (Days)")
 
@@ -523,6 +523,15 @@ except Exception as exc:
 if df_all.empty:
     st.error("❌ The file parsed successfully but contains no data rows.")
     st.stop()
+
+if report.missing_columns:
+    st.error(
+        "**This export is missing columns the dashboard needs**, so parts of "
+        "it will be blank. Either the portal changed its column names, or the "
+        "header row was not found.\n\n"
+        f"**Missing:** {', '.join(report.missing_columns)}\n\n"
+        f"**Found instead:** {', '.join(report.found_columns) or '(none)'}"
+    )
 
 if report.unmapped_subcategories:
     st.warning(
