@@ -30,6 +30,7 @@ SHEET_PUB = (
 GID_COLUMNS = 0
 GID_STATUS = 907869929
 GID_CATEGORY = 553718957
+GID_SURVEYORS = 1135077801
 
 # Raw portal sub-category string -> master sub-category label.
 # Empty as of 2026-09-09: the master sheet now carries the portal's exact
@@ -53,6 +54,14 @@ class Definitions:
     statuses: list[str]
     subcategory_to_category: dict[str, str]   # normalised key -> category
     subcategory_label: dict[str, str]         # normalised key -> master label
+    # Kanpur's surveyors share one portal login, so a ticket cannot name who
+    # raised it. Zone is the only attributable field, hence zone -> surveyor.
+    surveyor_assignments: list[dict] = field(default_factory=list)
+
+    @property
+    def zone_to_surveyor(self) -> dict[str, str]:
+        """Current holder per zone. History lives in surveyor_assignments."""
+        return assignments_to_current(self.surveyor_assignments)
 
     @property
     def categories(self) -> list[str]:
@@ -61,6 +70,15 @@ class Definitions:
             if cat not in seen:
                 seen.append(cat)
         return seen
+
+
+def zone_digits(value: object) -> str | None:
+    """'Zone 5' / '5' / 'Zone-05' -> '5'. The mapping sheet stores a bare
+    number while the export writes 'Zone 5', so both collapse to the digits."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    m = re.search(r"\d+", str(value))
+    return str(int(m.group())) if m else None
 
 
 def _norm_key(value: object) -> str:
@@ -121,6 +139,121 @@ def _parse_category_frame(cat: pd.DataFrame) -> tuple[dict, dict]:
     return sub_to_cat, sub_label
 
 
+def _parse_surveyor_frame(df: pd.DataFrame) -> list[dict]:
+    """Name/Zone(/Effective from)(/Effective to) table -> assignment periods.
+
+    A zone can change hands. Editing a name in place would rewrite history --
+    last quarter's tickets would silently re-credit to whoever holds the zone
+    now -- so assignments are dated instead:
+
+        Name    Zone  Effective from
+        Ashish  1
+        Raman   4
+        Suraj   5
+        Priya   4     01/10/2026        <- Raman keeps zone 4 up to 30 Sep
+
+    Rules, chosen so the common case needs no dates at all:
+      * No date column, or a blank date: the assignment always applied.
+      * The earliest assignment for a zone extends backwards indefinitely, so
+        tickets predating the sheet are still attributed.
+      * An assignment runs until the next one for that zone begins.
+      * An explicit 'Effective to' overrides that and wins.
+    """
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    name_col = next((c for c in df.columns if re.search(r"name|surveyor", c, re.I)), None)
+    zone_col = next((c for c in df.columns if re.search(r"zone", c, re.I)), None)
+    if not name_col or not zone_col:
+        raise ValueError("Surveyor sheet needs a Name column and a Zone column")
+
+    from_col = next(
+        (c for c in df.columns
+         if re.search(r"effective from|from|start|since|w\.?e\.?f", c, re.I)), None
+    )
+    to_col = next(
+        (c for c in df.columns
+         if c != from_col and re.search(r"effective to|to|until|till|end", c, re.I)), None
+    )
+
+    rows = []
+    for _, row in df.iterrows():
+        name = str(row[name_col]).strip() if pd.notna(row[name_col]) else ""
+        zone = zone_digits(row[zone_col])
+        if not name or not zone:
+            continue
+        start = pd.to_datetime(row[from_col], dayfirst=True, errors="coerce") if from_col else pd.NaT
+        end = pd.to_datetime(row[to_col], dayfirst=True, errors="coerce") if to_col else pd.NaT
+        rows.append({
+            "zone": zone, "name": name,
+            "start": None if pd.isna(start) else start,
+            "end": None if pd.isna(end) else end.normalize() + pd.Timedelta(days=1)
+                  - pd.Timedelta(seconds=1),   # inclusive of the stated day
+            "explicit_end": not pd.isna(end),
+        })
+
+    # Order within each zone, then close each period at the next one's start.
+    rows.sort(key=lambda r: (int(r["zone"]),
+                             r["start"] or pd.Timestamp.min, r["name"]))
+    by_zone: dict[str, list[dict]] = {}
+    for r in rows:
+        by_zone.setdefault(r["zone"], []).append(r)
+
+    for zone_rows in by_zone.values():
+        for i, r in enumerate(zone_rows):
+            if i == 0:
+                r["start"] = None          # earliest holder covers all history
+            if not r["explicit_end"]:
+                nxt = zone_rows[i + 1] if i + 1 < len(zone_rows) else None
+                r["end"] = (nxt["start"] - pd.Timedelta(seconds=1)
+                            if nxt and nxt["start"] is not None else None)
+    return rows
+
+
+def assignments_to_current(assignments: list[dict]) -> dict[str, str]:
+    """Latest holder per zone -- for display and for the no-dates case."""
+    current = {}
+    for a in assignments:
+        if a["end"] is None:
+            current[a["zone"]] = a["name"]
+    for a in assignments:                 # zones whose last period has ended
+        current.setdefault(a["zone"], a["name"])
+    return current
+
+
+def attribute_surveyor(
+    zone_no: pd.Series, when: pd.Series, assignments: list[dict]
+) -> pd.Series:
+    """Map each ticket to whoever held its zone on the date it was raised."""
+    out = pd.Series(pd.NA, index=zone_no.index, dtype="object")
+    for a in assignments:
+        mask = zone_no == a["zone"]
+        if a["start"] is not None:
+            mask &= when >= a["start"]
+        if a["end"] is not None:
+            mask &= when <= a["end"]
+        out[mask.fillna(False)] = a["name"]
+    return out
+
+
+def load_surveyors(sheet_pub: str = SHEET_PUB) -> list[dict]:
+    return _parse_surveyor_frame(pd.read_csv(sheet_pub.format(gid=GID_SURVEYORS)))
+
+
+def load_surveyors_file(path) -> list[dict]:
+    path = str(path)
+    df = (pd.read_excel(path) if path.lower().endswith((".xlsx", ".xlsm", ".xls"))
+          else pd.read_csv(path))
+    return _parse_surveyor_frame(df)
+
+
+def load_surveyors_bytes(data: bytes, filename: str) -> list[dict]:
+    import io
+    buf = io.BytesIO(data)
+    df = (pd.read_excel(buf) if filename.lower().endswith((".xlsx", ".xlsm", ".xls"))
+          else pd.read_csv(buf))
+    return _parse_surveyor_frame(df)
+
+
 def load_definitions(sheet_pub: str = SHEET_PUB) -> Definitions:
     """Read the three master tabs from the published sheet.
 
@@ -139,10 +272,16 @@ def load_definitions(sheet_pub: str = SHEET_PUB) -> Definitions:
     sub_to_cat, sub_label = _parse_category_frame(
         pd.read_csv(sheet_pub.format(gid=GID_CATEGORY))
     )
-    return Definitions(columns, statuses, sub_to_cat, sub_label)
+    # The Surveyors tab may not be published yet; categories must still load.
+    try:
+        zone_map = load_surveyors(sheet_pub)
+    except Exception:
+        zone_map = list(FALLBACK_SURVEYORS)
+    return Definitions(columns, statuses, sub_to_cat, sub_label, zone_map)
 
 
 DEFINITIONS_FILENAMES = ("definitions.csv", "definitions.xlsx")
+SURVEYOR_FILENAMES = ("surveyors.csv", "surveyors.xlsx")
 
 
 def load_definitions_file(path) -> Definitions:
@@ -160,8 +299,18 @@ def load_definitions_file(path) -> Definitions:
     sub_to_cat, sub_label = _parse_category_frame(cat)
     if not sub_to_cat:
         raise ValueError(f"No usable Category/Sub category rows found in {path}")
+    zone_map = dict(FALLBACK_SURVEYORS)
+    from pathlib import Path as _Path
+    for sibling in SURVEYOR_FILENAMES:
+        candidate = _Path(path).parent / sibling
+        if candidate.exists():
+            try:
+                zone_map = load_surveyors_file(candidate)
+            except Exception:
+                pass
+            break
     return Definitions(
-        list(EXPECTED_COLUMNS), list(FALLBACK_STATUSES), sub_to_cat, sub_label
+        list(EXPECTED_COLUMNS), list(FALLBACK_STATUSES), sub_to_cat, sub_label, zone_map
     )
 
 
@@ -177,7 +326,8 @@ def load_definitions_bytes(data: bytes, filename: str) -> Definitions:
     if not sub_to_cat:
         raise ValueError("No usable Category/Sub category rows in the upload")
     return Definitions(
-        list(EXPECTED_COLUMNS), list(FALLBACK_STATUSES), sub_to_cat, sub_label
+        list(EXPECTED_COLUMNS), list(FALLBACK_STATUSES), sub_to_cat, sub_label,
+        list(FALLBACK_SURVEYORS),
     )
 
 
@@ -405,6 +555,14 @@ FALLBACK_CATEGORY_ROWS = [
 ]
 FALLBACK_STATUSES = ["Pending", "Rejected", "Completed"]
 
+# Zone -> surveyor, as of the Surveyors tab on 2026-09-11. Used only when that
+# tab cannot be read. Zones not listed here leave their tickets unattributed.
+FALLBACK_SURVEYORS = [
+    {"zone": "1", "name": "Ashish", "start": None, "end": None, "explicit_end": False},
+    {"zone": "4", "name": "Raman", "start": None, "end": None, "explicit_end": False},
+    {"zone": "5", "name": "Suraj", "start": None, "end": None, "explicit_end": False},
+]
+
 
 def fallback_definitions() -> Definitions:
     return Definitions(
@@ -412,6 +570,7 @@ def fallback_definitions() -> Definitions:
         statuses=list(FALLBACK_STATUSES),
         subcategory_to_category={_norm_key(s): c for c, s in FALLBACK_CATEGORY_ROWS},
         subcategory_label={_norm_key(s): s for c, s in FALLBACK_CATEGORY_ROWS},
+        surveyor_assignments=list(FALLBACK_SURVEYORS),
     )
 
 
