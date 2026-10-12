@@ -22,6 +22,7 @@ import streamlit as st
 
 from kanpur_normalize import (
     DEFINITIONS_FILENAMES,
+    MODULE_VERSION,
     SURVEYOR_FILENAMES,
     attribute_surveyor,
     load_surveyors_bytes,
@@ -43,7 +44,7 @@ CITY = "Kanpur"
 
 # Bump on every deploy. Shown in the sidebar so a stale build on Streamlit
 # Cloud is visible immediately instead of being mistaken for a code bug.
-APP_VERSION = "2026-10-12a"
+APP_VERSION = "2026-10-12b"
 
 st.set_page_config(
     page_title=f"{CITY} DSP Dashboard",
@@ -480,6 +481,19 @@ def download_csv(df: pd.DataFrame, label: str, filename: str):
 
 st.title(f"📊 {CITY} DSP Dashboard")
 st.markdown("---")
+
+# app.py and kanpur_normalize.py are a matched pair. Deploying one without the
+# other is the most common failure here, so say so rather than crashing later.
+REQUIRED_MODULE_VERSION = "2026-10-12b"
+if MODULE_VERSION != REQUIRED_MODULE_VERSION:
+    st.error(
+        f"**Mismatched files.** `app.py` is build **{APP_VERSION}** and needs "
+        f"`kanpur_normalize.py` build **{REQUIRED_MODULE_VERSION}**, but the "
+        f"one loaded is **{MODULE_VERSION}**.\n\n"
+        f"Deploy both files together. If both are already committed, the app "
+        f"is running a stale process — reboot it from *Manage app*."
+    )
+    st.stop()
 
 defs, defs_source, defs_error, defs_stamp = cached_definitions()
 
