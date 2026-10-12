@@ -21,6 +21,11 @@ import pandas as pd
 
 # ---------------------------------------------------------------- definitions
 
+# Bumped whenever app.py starts relying on something new here. app.py checks
+# it on startup so a half-deployed pair reports itself instead of failing with
+# an AttributeError deep in the page.
+MODULE_VERSION = "2026-10-12b"
+
 SHEET_PUB = (
     "https://docs.google.com/spreadsheets/d/e/"
     "2PACX-1vTF0TbAXN6O1-Te6vCMlE9r-BbKb7Z-TrFVm2FMPx-ioorWRJFXM4mjqSy-VbxlSh4nCBlF6PtnMbyv"
@@ -299,7 +304,9 @@ def load_definitions_file(path) -> Definitions:
     sub_to_cat, sub_label = _parse_category_frame(cat)
     if not sub_to_cat:
         raise ValueError(f"No usable Category/Sub category rows found in {path}")
-    zone_map = dict(FALLBACK_SURVEYORS)
+    # A list of dated assignments, not a {zone: name} dict -- see
+    # _parse_surveyor_frame. dict() on this raises a confusing ValueError.
+    zone_map = list(FALLBACK_SURVEYORS)
     from pathlib import Path as _Path
     for sibling in SURVEYOR_FILENAMES:
         candidate = _Path(path).parent / sibling
