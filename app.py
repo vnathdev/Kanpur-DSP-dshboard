@@ -22,6 +22,11 @@ import streamlit as st
 
 from kanpur_normalize import (
     DEFINITIONS_FILENAMES,
+    SURVEYOR_FILENAMES,
+    attribute_surveyor,
+    load_surveyors_bytes,
+    load_surveyors_file,
+    zone_digits,
     SHEET_PUB,
     Definitions,
     distinct_subcategories,
@@ -35,6 +40,10 @@ from kanpur_normalize import (
 )
 
 CITY = "Kanpur"
+
+# Bump on every deploy. Shown in the sidebar so a stale build on Streamlit
+# Cloud is visible immediately instead of being mistaken for a code bug.
+APP_VERSION = "2026-10-12a"
 
 st.set_page_config(
     page_title=f"{CITY} DSP Dashboard",
@@ -65,6 +74,13 @@ CATEGORY_ICONS = {
     "Unmapped": "❓",
 }
 
+CATEGORY_COLOURS = {
+    "Sanitation": "#3B71CA",
+    "Engineering": "#E4A11B",
+    "Malba": "#8B5E3C",
+    "Unmapped": "#9CA3AF",
+}
+
 AGE_BUCKETS = ["< 1 Month", "1-6 Months", "6-12 Months", "> 1 Year"]
 
 CATEGORY20 = [
@@ -80,6 +96,7 @@ VIEWS = [
     "Zone-wise Drill-Down",
     "Ward-wise Drill-Down",
     "Officer Leaderboard",
+    "Surveyor Performance",
     "Age-wise Pendency",
     "Monthly Trend Analysis",
     "Custom Date Range Analysis",
@@ -196,6 +213,19 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
         df["officer_name"].fillna("Unassigned").replace("", "Unassigned")
     )
 
+    df["ZoneNo"] = df["zone"].map(zone_digits)
+    df["DateOnly"] = df["opened_at"].dt.date
+    df["ISOWeek"] = df["opened_at"].dt.strftime("%G-W%V")
+    fy_start = df["opened_at"].dt.year.where(df["opened_at"].dt.month >= 4,
+                                             df["opened_at"].dt.year - 1)
+    fq = df["opened_at"].dt.month.map(
+        {4: "Q1", 5: "Q1", 6: "Q1", 7: "Q2", 8: "Q2", 9: "Q2",
+         10: "Q3", 11: "Q3", 12: "Q3", 1: "Q4", 2: "Q4", 3: "Q4"}
+    )
+    df["FYQuarter"] = (
+        "FY " + fy_start.astype("Int64").astype(str) + "-"
+        + (fy_start + 1).astype("Int64").astype(str).str[-2:] + " " + fq
+    )
     df["MonthKey"] = df["opened_at"].dt.to_period("M").astype(str)
     df["ClosedMonthKey"] = df["closed_at"].dt.to_period("M").astype(str)
     return df
@@ -329,27 +359,49 @@ def _no_data_chart(title: str, height: int):
     )
 
 
+LABEL_MIN_PCT = 4        # below this a slice is too thin to label legibly
+
+
+def _doughnut(counts: pd.DataFrame, field: str, color, title: str, height: int):
+    """Doughnut with the share printed on each slice.
+
+    Arc and label share one base so their stacking order is identical --
+    building them as separate charts lets Altair order them differently and
+    the labels drift onto the wrong slices.
+    """
+    total = counts["Count"].sum()
+    counts = counts.copy()
+    counts["Pct"] = counts["Count"] / total * 100 if total else 0
+    counts["Percent"] = counts["Pct"].round(1).astype(str) + "%"
+
+    base = alt.Chart(counts).encode(
+        theta=alt.Theta(field="Count", type="quantitative", stack=True),
+        color=color,
+        order=alt.Order("Count:Q", sort="descending"),
+        tooltip=[field, "Count", "Percent"],
+    )
+    arc = base.mark_arc(innerRadius=45, outerRadius=78)
+    # Labels sit just outside the ring and take the slice's own colour, which
+    # reads on both the light and dark Streamlit themes.
+    label = base.mark_text(radius=95, fontSize=11, fontWeight="bold").encode(
+        text=alt.Text("Percent:N"),
+    ).transform_filter(alt.datum.Pct >= LABEL_MIN_PCT)
+    return (arc + label).properties(title=title, height=height)
+
+
 def draw_doughnut(df: pd.DataFrame, title: str, show_legend: bool = True, height: int = 250):
     if df.empty:
         return _no_data_chart(title, height)
     counts = df["StatusBucket"].value_counts().reset_index()
     counts.columns = ["Status", "Count"]
-    counts["Percent"] = (
-        counts["Count"] / counts["Count"].sum() * 100
-    ).round(1).astype(str) + "%"
 
     legend = alt.Legend(orient="right", title=None) if show_legend else None
-    return (
-        alt.Chart(counts).mark_arc(innerRadius=40).encode(
-            theta=alt.Theta(field="Count", type="quantitative"),
-            color=alt.Color(
-                field="Status", type="nominal",
-                scale=alt.Scale(domain=STATUS_COLUMNS, range=STATUS_RANGE),
-                legend=legend,
-            ),
-            tooltip=["Status", "Count", "Percent"],
-        ).properties(title=title, height=height)
+    color = alt.Color(
+        field="Status", type="nominal",
+        scale=alt.Scale(domain=STATUS_COLUMNS, range=STATUS_RANGE),
+        legend=legend,
     )
+    return _doughnut(counts, "Status", color, title, height)
 
 
 def draw_contribution_doughnut(
@@ -360,9 +412,6 @@ def draw_contribution_doughnut(
         return _no_data_chart(title, height)
     counts = df[category_col].value_counts().reset_index()
     counts.columns = ["Category", "Count"]
-    counts["Percent"] = (
-        counts["Count"] / counts["Count"].sum() * 100
-    ).round(1).astype(str) + "%"
 
     legend = alt.Legend(orient="right", title=None) if show_legend else None
     color = (
@@ -370,13 +419,7 @@ def draw_contribution_doughnut(
         if color_scale
         else alt.Color(field="Category", type="nominal", legend=legend)
     )
-    return (
-        alt.Chart(counts).mark_arc(innerRadius=40).encode(
-            theta=alt.Theta(field="Count", type="quantitative"),
-            color=color,
-            tooltip=["Category", "Count", "Percent"],
-        ).properties(title=title, height=height)
-    )
+    return _doughnut(counts, "Category", color, title, height)
 
 
 def colour_legend(labels: list[str], colours: list[str]) -> str:
@@ -468,10 +511,34 @@ with st.sidebar.expander("⚙️ Category definitions"):
         except Exception as exc:
             st.error(f"Definitions file unreadable — {exc}")
 
+    sv_upload = st.file_uploader(
+        "Surveyor mapping override", type=["csv", "xlsx"],
+        help="Surveyors tab exported as CSV: a Name column and a Zone column.",
+    )
+    if sv_upload is not None:
+        try:
+            st.session_state["surveyor_override"] = load_surveyors_bytes(
+                sv_upload.getvalue(), sv_upload.name
+            )
+        except Exception as exc:
+            st.error(f"Surveyor mapping unreadable — {exc}")
+
 if "defs_override" in st.session_state:
     defs, defs_source, defs_error = (
         st.session_state["defs_override"], "uploaded definitions file", None,
     )
+
+# A local surveyors file, then an upload, each override what the sheet gave.
+for _sv_name in SURVEYOR_FILENAMES:
+    _sv_path = APP_DIR / _sv_name
+    if _sv_path.exists():
+        try:
+            defs.surveyor_assignments = load_surveyors_file(_sv_path)
+        except Exception:
+            pass
+        break
+if "surveyor_override" in st.session_state:
+    defs.surveyor_assignments = st.session_state["surveyor_override"]
 
 n_subs = len(defs.subcategory_to_category)
 if defs_error:
@@ -490,6 +557,7 @@ else:
         f"loaded {defs_stamp}."
     )
 
+st.sidebar.caption(f"Build {APP_VERSION}")
 st.sidebar.markdown("---")
 st.sidebar.header("🧭 Navigation")
 
@@ -508,15 +576,28 @@ if upload is None:
     st.dataframe(definitions_table(defs), hide_index=True, **FULL_WIDTH)
     st.stop()
 
-defs_key = (tuple(sorted(defs.subcategory_to_category.items())), tuple(defs.statuses))
+# The surveyor mapping must be part of the cache key too, or editing it leaves
+# the parsed frame -- and every attributed figure -- stale.
+defs_key = (
+    tuple(sorted(defs.subcategory_to_category.items())),
+    tuple(defs.statuses),
+    tuple(sorted(
+        (a["zone"], a["name"], str(a["start"]), str(a["end"]))
+        for a in defs.surveyor_assignments
+    )),
+)
 try:
     df_all, report, distinct_subs = cached_parse(
         upload.getvalue(), upload.name, defs_key
     )
 except Exception as exc:
     st.error(
-        f"❌ Could not parse **{upload.name}**. Check that it is an unmodified "
-        f"portal export.\n\n`{type(exc).__name__}: {exc}`"
+        f"❌ Could not parse **{upload.name}**.\n\n"
+        f"`{type(exc).__name__}: {exc}`\n\n"
+        f"Running build **{APP_VERSION}**. If this says "
+        f"`'NaTType' object has no attribute 'isna'`, the deployment is on an "
+        f"older `kanpur_normalize.py` — that error cannot occur in this build, "
+        f"which reports missing columns instead of failing."
     )
     st.stop()
 
@@ -533,12 +614,29 @@ if report.missing_columns:
         f"**Found instead:** {', '.join(report.found_columns) or '(none)'}"
     )
 
+# Tickets whose sub-category is not in the definitions are excluded from every
+# analysis view, so no figure is built on a category we could not determine.
+# df_full keeps them for the Data Quality view, which is where they belong.
+df_full = df_all
+df_all = df_all[df_all["MainCategory"] != "Unmapped"]
+
 if report.unmapped_subcategories:
+    excluded = sum(report.unmapped_subcategories.values())
     st.warning(
-        f"⚠️ {sum(report.unmapped_subcategories.values())} tickets have "
-        f"sub-categories missing from the definitions and are counted under "
-        f"**Unmapped**. See the *Data Quality* view."
+        f"⚠️ **{excluded} of {len(df_full)} tickets excluded.** Their "
+        f"sub-categories are missing from the definitions, so they cannot be "
+        f"attributed to a category. Every figure below is out of "
+        f"**{len(df_all)}** tickets, not {len(df_full)}. Add the missing "
+        f"sub-categories in the *Data Quality* view to bring them in."
     )
+
+if df_all.empty:
+    st.error(
+        "❌ Every ticket in this export has a sub-category missing from the "
+        "definitions, so there is nothing left to analyse. See *Data Quality* "
+        "for the list of unmapped values."
+    )
+    st.stop()
 
 categories = ordered_categories(df_all)
 view = st.session_state.current_view
@@ -573,6 +671,45 @@ if view == "Main Category Summary":
         )
 
         st.markdown("---")
+        st.markdown("##### 🥧 Ticket Share by Category")
+
+        cat_scale = alt.Scale(
+            domain=categories,
+            range=[CATEGORY_COLOURS.get(c, "#9CA3AF") for c in categories],
+        )
+        st.markdown(
+            colour_legend(
+                categories,
+                [CATEGORY_COLOURS.get(c, "#9CA3AF") for c in categories],
+            ),
+            unsafe_allow_html=True,
+        )
+
+        share1, share2 = st.columns(2)
+        with share1:
+            st.altair_chart(
+                draw_contribution_doughnut(
+                    df, "MainCategory", "Total Raised",
+                    show_legend=False, height=280, color_scale=cat_scale,
+                ),
+                **FULL_WIDTH,
+            )
+        with share2:
+            st.altair_chart(
+                draw_contribution_doughnut(
+                    df[df["StatusBucket"] == "CLOSED"], "MainCategory",
+                    "Total Closed", show_legend=False, height=280,
+                    color_scale=cat_scale,
+                ),
+                **FULL_WIDTH,
+            )
+        st.caption(
+            "Left: share of all tickets raised. Right: share of those closed — "
+            "a category larger on the right than the left is being cleared "
+            "faster than the rest."
+        )
+
+        st.markdown("---")
         st.markdown("##### 🍩 Status Split by Category")
         st.markdown(status_legend_row(), unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
@@ -584,7 +721,7 @@ if view == "Main Category Summary":
                     draw_doughnut(
                         df[df["MainCategory"] == cat],
                         f"{CATEGORY_ICONS.get(cat, '📁')} {cat}",
-                        show_legend=False, height=220,
+                        show_legend=False, height=260,
                     ),
                     **FULL_WIDTH,
                 )
@@ -677,7 +814,7 @@ elif view == "Zone-wise Drill-Down":
                             st.altair_chart(
                                 draw_doughnut(
                                     cat_df[cat_df["Zone"] == zone], zone,
-                                    show_legend=False, height=220,
+                                    show_legend=False, height=260,
                                 ),
                                 **FULL_WIDTH,
                             )
@@ -818,6 +955,170 @@ elif view == "Officer Leaderboard":
                     named, "Officer", f"{cat} Total", show_avg_time=True
                 )
             )
+
+
+# ==========================================
+# SURVEYOR PERFORMANCE
+# ==========================================
+elif view == "Surveyor Performance":
+    st.subheader("🧭 Surveyor Performance")
+
+    assignments = defs.surveyor_assignments
+    if not assignments:
+        st.error(
+            "No zone-to-surveyor mapping is loaded. Publish the **Surveyors** "
+            "tab as CSV, or drop a `surveyors.csv` (Name, Zone) beside "
+            "`app.py`, or upload one under *Category definitions* in the sidebar."
+        )
+        st.stop()
+
+    st.caption(
+        "Kanpur's surveyors share one portal login, so tickets are attributed "
+        "by **zone**, not by who raised them. Treat this as ticket output per "
+        "zone-owner, not as an attendance record — a day spent surveying with "
+        "nothing found looks the same as a day off, and cover for a colleague "
+        "lands on the wrong name."
+    )
+
+    with st.expander("Zone → surveyor assignments in use"):
+        st.dataframe(
+            pd.DataFrame([{
+                "Zone": a["zone"],
+                "Surveyor": a["name"],
+                "From": "—" if a["start"] is None else f"{a['start']:%d %b %Y}",
+                "To": "current" if a["end"] is None else f"{a['end']:%d %b %Y}",
+            } for a in sorted(assignments, key=lambda a: (int(a["zone"]),
+                              a["start"] or pd.Timestamp.min))],),
+            hide_index=True, **FULL_WIDTH,
+        )
+        st.caption(
+            "Tickets are credited to whoever held the zone **on the day the "
+            "ticket was raised**, so a handover leaves earlier months "
+            "untouched. To reassign a zone, add a row with an *Effective "
+            "from* date rather than editing the existing row."
+        )
+
+    # --- who raised the ticket -------------------------------------------
+    complainants = (
+        df_all["complainant_name"].fillna("(blank)").value_counts()
+    )
+    dsp_like = [c for c in complainants.index if "dsp" in str(c).lower()]
+    st.markdown("##### 👤 Whose tickets to count")
+    picked_complainants = st.multiselect(
+        "Complainant (the shared login raises the team's tickets; citizens "
+        "raise their own)",
+        complainants.index.tolist(),
+        default=dsp_like or complainants.index.tolist(),
+        format_func=lambda c: f"{c} ({complainants[c]})",
+    )
+    if not dsp_like:
+        st.warning(
+            "⚠️ No complainant name contains 'DSP', so every ticket is "
+            "selected by default — including citizen complaints, which would "
+            "inflate the counts. Pick the survey login explicitly."
+        )
+    if not picked_complainants:
+        st.info("Select at least one complainant.")
+        st.stop()
+
+    sv = df_all[df_all["complainant_name"].fillna("(blank)").isin(picked_complainants)].copy()
+    sv["Surveyor"] = attribute_surveyor(sv["ZoneNo"], sv["opened_at"], assignments)
+
+    unattributed = sv[sv["Surveyor"].isna()]
+    sv = sv.dropna(subset=["Surveyor"])
+
+    if not unattributed.empty:
+        zones_missing = sorted(
+            unattributed["zone"].fillna("(not recorded)").unique().tolist()
+        )
+        st.warning(
+            f"⚠️ {len(unattributed)} tickets have no surveyor for their zone "
+            f"on the date they were raised, and are excluded. Zones involved: "
+            f"{', '.join(zones_missing)}. This can mean the zone is missing "
+            f"from the sheet, or that an *Effective from* date starts after "
+            f"the ticket."
+        )
+
+    if sv.empty:
+        st.warning("⚠️ No tickets could be attributed to a surveyor.")
+        st.stop()
+
+    def period_summary(frame: pd.DataFrame, key: str) -> pd.DataFrame:
+        out = (
+            frame.dropna(subset=[key])
+            .groupby(["Surveyor", key])
+            .agg(**{
+                "Days active": ("DateOnly", "nunique"),
+                "Tickets": ("comp_no", "size"),
+                "Wards visited": ("Ward", "nunique"),
+                "Zones visited": ("zone", "nunique"),
+            })
+            .reset_index()
+            .rename(columns={key: key})
+        )
+        out["Tickets/day"] = (out["Tickets"] / out["Days active"]).round(1)
+        return out.sort_values([key, "Tickets"], ascending=[False, False])
+
+    tabs = st.tabs(["📅 Daily", "🗓️ Weekly", "📆 Monthly", "📊 FY Quarter"])
+
+    # ---- Daily ----------------------------------------------------------
+    with tabs[0]:
+        daily = period_summary(sv, "DateOnly").rename(columns={"DateOnly": "Date"})
+        if daily.empty:
+            st.info("No dated tickets to summarise.")
+        else:
+            st.dataframe(daily, hide_index=True, **FULL_WIDTH)
+            download_csv(daily, "⬇️ Download daily summary (CSV)", "kanpur_surveyor_daily.csv")
+
+            st.markdown("###### 📍 Zone & ward detail by day")
+            detail = (
+                sv.dropna(subset=["DateOnly"])
+                .groupby(["DateOnly", "Surveyor", "zone", "Ward"])
+                .agg(Tickets=("comp_no", "size"))
+                .reset_index()
+                .rename(columns={"DateOnly": "Date", "zone": "Zone"})
+                .sort_values(["Date", "Surveyor", "Tickets"], ascending=[False, True, False])
+            )
+            pick_day = st.selectbox(
+                "Show detail for", ["All days"] + [
+                    str(d) for d in sorted(detail["Date"].unique(), reverse=True)
+                ],
+            )
+            shown = detail if pick_day == "All days" else detail[
+                detail["Date"].astype(str) == pick_day
+            ]
+            st.dataframe(shown, hide_index=True, **FULL_WIDTH)
+            download_csv(shown, "⬇️ Download ward detail (CSV)", "kanpur_surveyor_daily_detail.csv")
+
+    # ---- Weekly / Monthly / Quarterly -----------------------------------
+    for tab, key, label in (
+        (tabs[1], "ISOWeek", "Week"),
+        (tabs[2], "MonthKey", "Month"),
+        (tabs[3], "FYQuarter", "Quarter"),
+    ):
+        with tab:
+            table = period_summary(sv, key).rename(columns={key: label})
+            if table.empty:
+                st.info(f"No dated tickets to summarise by {label.lower()}.")
+                continue
+            st.dataframe(table, hide_index=True, **FULL_WIDTH)
+
+            st.altair_chart(
+                alt.Chart(table).mark_bar().encode(
+                    x=alt.X(f"{label}:N", title=None),
+                    y=alt.Y("Tickets:Q"),
+                    color=alt.Color("Surveyor:N", legend=alt.Legend(orient="top", title=None)),
+                    xOffset="Surveyor:N",
+                    tooltip=[label, "Surveyor", "Days active", "Tickets",
+                             "Wards visited", "Zones visited"],
+                ).properties(height=320),
+                **FULL_WIDTH,
+            )
+            download_csv(
+                table, f"⬇️ Download {label.lower()} summary (CSV)",
+                f"kanpur_surveyor_{label.lower()}.csv",
+            )
+
 
 
 # ==========================================
@@ -1054,8 +1355,10 @@ elif view == "Data Quality":
     if report.unmapped_subcategories:
         st.markdown("##### ❓ Unmapped Sub-categories")
         st.markdown(
-            "These are counted under `Unmapped` and excluded from category "
-            "comparisons. Compare the export values against what the app "
+            "These tickets are **excluded from every other view** — they "
+            "cannot be attributed to a category, so counting them would "
+            "distort the totals. They remain in the cleaned-data download "
+            "below. Compare the export values against what the app "
             "actually loaded — if a value looks present in your sheet but "
             "missing here, the app is reading an older copy."
         )
@@ -1090,7 +1393,7 @@ elif view == "Data Quality":
         "kanpur_subcategories_in_export.csv",
     )
 
-    recat = df_all[df_all["recategorised"]]
+    recat = df_full[df_full["recategorised"]]
     if not recat.empty:
         st.markdown(f"##### 🔄 Reclassified Tickets ({len(recat)})")
         st.caption(
@@ -1106,5 +1409,5 @@ elif view == "Data Quality":
 
     st.markdown("##### 💾 Cleaned Data")
     download_csv(
-        df_all, "⬇️ Download cleaned data (CSV)", "kanpur_grievances_cleaned.csv"
+        df_full, "⬇️ Download cleaned data (CSV)", "kanpur_grievances_cleaned.csv"
     )
